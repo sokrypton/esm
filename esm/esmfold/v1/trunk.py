@@ -155,25 +155,29 @@ class FoldingTrunk(nn.Module):
         self.chunk_size = chunk_size
 
     def forward(self, get_lm_feats,
-        true_aa,
+        true_aa,  # <--- MODIFIED: Back to 'true_aa'
         residx,
         mask,
         no_recycles: T.Optional[int] = None,
         mask_rate: float = 0.0,
+        true_aa_esm: T.Optional[torch.Tensor] = None,  # <--- MODIFIED: Added as optional
         ):
         
         """
         Inputs:
-          seq_feats:     B x L x C            tensor of sequence features
-          pair_feats:    B x L x L x C        tensor of pair features
+          get_lm_feats:  Function to get LM features.
+          true_aa:       B x L                (Fold sequence)
           residx:        B x L                long tensor giving the position in the sequence
           mask:          B x L                boolean tensor indicating valid residues
-
+          true_aa_esm:   B x L                (ESM sequence, optional)
         Output:
-          predicted_structure: B x L x (num_atoms_per_residue * 3) tensor wrapped in a Coordinates object
+          predicted_structure: ...
         """
 
-        device = true_aa.device
+        if true_aa_esm is None:  # <--- MODIFIED: Default to true_aa
+            true_aa_esm = true_aa
+
+        device = true_aa.device 
 
         if no_recycles is None:
             no_recycles = self.cfg.max_recycles
@@ -188,7 +192,8 @@ class FoldingTrunk(nn.Module):
                 s, z = block(s, z, mask=mask, residue_index=residx, chunk_size=self.chunk_size)
             return s, z
 
-        seq_feat, pair_feat, lm_output = get_lm_feats(true_aa, mask_rate=mask_rate)
+        # Pass both sequences to get_lm_feats
+        seq_feat, pair_feat, lm_output = get_lm_feats(true_aa, true_aa_esm, mask_rate=mask_rate)
         s_s = seq_feat
         s_z = pair_feat
         recycle_s = torch.zeros_like(s_s)
@@ -202,7 +207,8 @@ class FoldingTrunk(nn.Module):
                 
                 # === updated LM features ===
                 if recycle_idx > 0 and mask_rate > 0:
-                  seq_feat, pair_feat, lm_output = get_lm_feats(true_aa, mask_rate=mask_rate)
+                  # Pass both sequences
+                  seq_feat, pair_feat, lm_output = get_lm_feats(true_aa, true_aa_esm, mask_rate=mask_rate)
 
                 # === Recycling ===
                 recycle_s = self.recycle_s_norm(recycle_s.detach())
@@ -213,7 +219,7 @@ class FoldingTrunk(nn.Module):
                 # === Structure module ===
                 structure = self.structure_module(
                     {"single": self.trunk2sm_s(s_s), "pair": self.trunk2sm_z(s_z)},
-                    true_aa,
+                    true_aa,  # Use true_aa
                     mask.float(),
                 )
 
