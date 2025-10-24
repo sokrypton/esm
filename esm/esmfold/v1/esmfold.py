@@ -131,14 +131,14 @@ class ESMFold(nn.Module):
         masking_pattern: T.Optional[torch.Tensor] = None,
         num_recycles: T.Optional[int] = None,
         mask_rate: float = 0.0,
-        return_contacts: bool = False
+        return_contacts: bool = False,
+        aa_esm: T.Optional[torch.Tensor] = None,  # <--- MODIFIED: Added as optional arg
     ):
         """Runs a forward pass given input tokens. Use `model.infer` to
         run inference from a sequence.
 
         Args:
-            aa (torch.Tensor): Tensor containing indices corresponding to amino acids. Indices match
-                openfold.np.residue_constants.restype_order_with_x.
+            aa (torch.Tensor): Tensor containing indices for the FOLDING trunk (embeddings, structure module).
             mask (torch.Tensor): Binary tensor with 1 meaning position is unmasked and 0 meaning position is masked.
             residx (torch.Tensor): Residue indices of amino acids. Will assume contiguous if not provided.
             masking_pattern (torch.Tensor): Optional masking to pass to the input. Binary tensor of the same size
@@ -146,7 +146,11 @@ class ESMFold(nn.Module):
                 different masks are provided.
             num_recycles (int): How many recycle iterations to perform. If None, defaults to training max
                 recycles, which is 3.
+            aa_esm (torch.Tensor, optional): Tensor containing indices for the ESM model. If None, `aa` is used.
         """
+
+        if aa_esm is None:  # <--- MODIFIED: Default to aa if aa_esm not given
+            aa_esm = aa
 
         if mask is None:
             mask = torch.ones_like(aa)
@@ -159,10 +163,10 @@ class ESMFold(nn.Module):
             residx = torch.arange(L, device=device).expand_as(aa)
 
         # === ESM ===
-        def get_lm_feats(aa, mask_rate):
+        def get_lm_feats(aa_fold_local, aa_esm_local, mask_rate):
             
-            esmaa = self._af2_idx_to_esm_idx(aa, mask)
-            random_mask = torch.rand(aa.shape, device=device) < mask_rate
+            esmaa = self._af2_idx_to_esm_idx(aa_esm_local, mask)  # Use aa_esm_local
+            random_mask = torch.rand(aa_esm_local.shape, device=device) < mask_rate  # Use aa_esm_local
             if masking_pattern is not None:
                 random_mask = random_mask * masking_pattern
             
@@ -179,16 +183,19 @@ class ESMFold(nn.Module):
             esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ esm_s).squeeze(2)
             s_s_0 = self.esm_s_mlp(esm_s)
             s_z_0 = s_s_0.new_zeros(B, L, L, self.cfg.trunk.pairwise_state_dim)
-            s_s_0 += self.embedding(aa)
+            s_s_0 += self.embedding(aa_fold_local)  # Use aa_fold_local (which is 'aa')
 
             # seq_feat, pair_feat
             return s_s_0, s_z_0, lm_output
 
         structure: dict = self.trunk(
             get_lm_feats,
-            aa, residx, mask,
+            aa,  # Pass aa (as true_aa)
+            residx,
+            mask,
             no_recycles=num_recycles,
             mask_rate=mask_rate,
+            true_aa_esm=aa_esm,  # Pass aa_esm as optional
         )
         # Documenting what we expect:
         structure = {
@@ -215,7 +222,7 @@ class ESMFold(nn.Module):
         lm_logits = self.lm_head(structure["s_s"])
         structure["lm_logits"] = lm_logits
 
-        structure["aatype"] = aa
+        structure["aatype"] = aa  # Use aa
         make_atom14_masks(structure)
 
         for k in [
@@ -258,48 +265,72 @@ class ESMFold(nn.Module):
         residue_index_offset: T.Optional[int] = 512,
         chain_linker: T.Optional[str] = "G" * 25,
         mask_rate: float = 0.0,
-        return_contacts: bool = False
+        return_contacts: bool = False,
+        sequences_esm: T.Optional[T.Union[str, T.List[str]]] = None,  # <--- This argument is already optional
     ):
         """Runs a forward pass given input sequences.
 
         Args:
-            sequences (Union[str, List[str]]): A list of sequences to make predictions for. Multimers can also be passed in,
+            sequences (Union[str, List[str]]): A list of sequences to make predictions for. This is used
+                for the folding trunk (embeddings, structure module). Multimers can also be passed in,
                 each chain should be separated by a ':' token (e.g. "<chain1>:<chain2>:<chain3>").
-            residx (torch.Tensor): Residue indices of amino acids. Will assume contiguous if not provided.
-            masking_pattern (torch.Tensor): Optional masking to pass to the input. Binary tensor of the same size
-                as `aa`. Positions with 1 will be masked. ESMFold sometimes produces different samples when
-                different masks are provided.
-            num_recycles (int): How many recycle iterations to perform. If None, defaults to training max
-                recycles (cfg.trunk.max_recycles), which is 4.
-            residue_index_offset (int): Residue index separation between chains if predicting a multimer. Has no effect on
-                single chain predictions. Default: 512.
-            chain_linker (str): Linker to use between chains if predicting a multimer. Has no effect on single chain
-                predictions. Default: length-25 poly-G ("G" * 25).
+            ... (other args) ...
+            sequences_esm (Union[str, List[str]], optional): A list of sequences to feed into ESM.
+                If None, `sequences` will be used. Must match batch size of `sequences`.
         """
         if isinstance(sequences, str):
             sequences = [sequences]
-
+        
+        # Handle sequences_esm
+        aatype_esm_tensor = None
+        if sequences_esm is not None:
+            if isinstance(sequences_esm, str):
+                sequences_esm = [sequences_esm]
+            
+            if len(sequences) != len(sequences_esm):
+                raise ValueError(
+                    f"Batch size mismatch: {len(sequences)} sequences for folding, "
+                    f"but {len(sequences_esm)} sequences for ESM."
+                )
+            # Encode ESM sequences
+            aatype_esm_tensor, mask_esm, _, _, _ = batch_encode_sequences(
+                sequences_esm, residue_index_offset, chain_linker
+            )
+        
+        # Encode folding sequences
         aatype, mask, _residx, linker_mask, chain_index = batch_encode_sequences(
             sequences, residue_index_offset, chain_linker
         )
+        
+        # Check mask consistency if aa_esm is provided
+        if aatype_esm_tensor is not None:
+             if not torch.all(mask == mask_esm):
+                # This is a sanity check. If lengths are different, things will break.
+                raise ValueError("Masks for folding and ESM sequences do not match. "
+                                    "This implies different sequence lengths or chain breaks.")
+
 
         if residx is None:
             residx = _residx
         elif not isinstance(residx, torch.Tensor):
             residx = collate_dense_tensors(residx)
 
+        # Add tensors to device
         aatype, mask, residx, linker_mask = map(
             lambda x: x.to(self.device), (aatype, mask, residx, linker_mask)
         )
-
+        if aatype_esm_tensor is not None:
+            aatype_esm_tensor = aatype_esm_tensor.to(self.device)
+        
         output = self.forward(
-            aatype,
+            aatype,  # This is aa
             mask=mask,
             residx=residx,
             masking_pattern=masking_pattern,
             num_recycles=num_recycles,
             mask_rate=mask_rate,
-            return_contacts=return_contacts
+            return_contacts=return_contacts,
+            aa_esm=aatype_esm_tensor  # Pass optional tensor (is None if not provided)
         )
 
         output["atom37_atom_exists"] = output[
