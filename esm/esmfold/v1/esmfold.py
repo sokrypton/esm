@@ -403,5 +403,3 @@ class ESMFold(nn.Module):
     @property
     def device(self):
         return self.esm_s_combine.device
-
-}
