@@ -133,6 +133,7 @@ class ESMFold(nn.Module):
         mask_rate: float = 0.0,
         return_contacts: bool = False,
         aa_esm: T.Optional[torch.Tensor] = None,  # <--- MODIFIED: Added as optional arg
+        lm_only: bool = False, # <--- ADDED
     ):
         """Runs a forward pass given input tokens. Use `model.infer` to
         run inference from a sequence.
@@ -147,6 +148,7 @@ class ESMFold(nn.Module):
             num_recycles (int): How many recycle iterations to perform. If None, defaults to training max
                 recycles, which is 3.
             aa_esm (torch.Tensor, optional): Tensor containing indices for the ESM model. If None, `aa` is used.
+            lm_only (bool, optional): If True, only run the language model and return representations.
         """
 
         if aa_esm is None:  # <--- MODIFIED: Default to aa if aa_esm not given
@@ -162,15 +164,37 @@ class ESMFold(nn.Module):
         if residx is None:
             residx = torch.arange(L, device=device).expand_as(aa)
 
-        # === ESM ===
+        # === LM_ONLY BYPASS ===
+        if lm_only:
+            esmaa = self._af2_idx_to_esm_idx(aa_esm, mask)
+            
+            # Use updated mask logic: use masking_pattern if provided, else fall back to mask_rate
+            if masking_pattern is not None:
+                final_mask = masking_pattern.to(device)
+            else:
+                final_mask = torch.rand(aa_esm.shape, device=device) < mask_rate
+            
+            esmaa = self._mask_inputs_to_esm(esmaa, final_mask)
+            esm_s, lm_output = self._compute_language_model_representations(esmaa, return_contacts=return_contacts)
+            
+            # Return a dictionary containing just the LM features
+            return {
+                "lm_output": lm_output,
+                "esm_representations": esm_s.to(self.esm_s_combine.dtype) # Match precision
+            }
+
+        # === ESM (Standard Forward Pass) ===
         def get_lm_feats(aa_fold_local, aa_esm_local, mask_rate):
             
             esmaa = self._af2_idx_to_esm_idx(aa_esm_local, mask)  # Use aa_esm_local
-            random_mask = torch.rand(aa_esm_local.shape, device=device) < mask_rate  # Use aa_esm_local
-            if masking_pattern is not None:
-                random_mask = random_mask * masking_pattern
             
-            esmaa = self._mask_inputs_to_esm(esmaa, random_mask)
+            # Use updated mask logic: use masking_pattern if provided, else fall back to mask_rate
+            if masking_pattern is not None:
+                final_mask = masking_pattern.to(device)
+            else:
+                final_mask = torch.rand(aa_esm_local.shape, device=device) < mask_rate
+            
+            esmaa = self._mask_inputs_to_esm(esmaa, final_mask)
             esm_s, lm_output = self._compute_language_model_representations(esmaa, return_contacts=return_contacts)
 
             # Convert esm_s to the precision used by the trunk and
@@ -267,6 +291,7 @@ class ESMFold(nn.Module):
         mask_rate: float = 0.0,
         return_contacts: bool = False,
         sequences_esm: T.Optional[T.Union[str, T.List[str]]] = None,  # <--- This argument is already optional
+        lm_only: bool = False, # <--- ADDED
     ):
         """Runs a forward pass given input sequences.
 
@@ -277,6 +302,7 @@ class ESMFold(nn.Module):
             ... (other args) ...
             sequences_esm (Union[str, List[str]], optional): A list of sequences to feed into ESM.
                 If None, `sequences` will be used. Must match batch size of `sequences`.
+            lm_only (bool, optional): If True, only run the language model and return representations.
         """
         if isinstance(sequences, str):
             sequences = [sequences]
@@ -322,6 +348,9 @@ class ESMFold(nn.Module):
         if aatype_esm_tensor is not None:
             aatype_esm_tensor = aatype_esm_tensor.to(self.device)
         
+        if masking_pattern is not None:
+            masking_pattern = masking_pattern.to(self.device)
+
         output = self.forward(
             aatype,  # This is aa
             mask=mask,
@@ -330,9 +359,15 @@ class ESMFold(nn.Module):
             num_recycles=num_recycles,
             mask_rate=mask_rate,
             return_contacts=return_contacts,
-            aa_esm=aatype_esm_tensor  # Pass optional tensor (is None if not provided)
+            aa_esm=aatype_esm_tensor,  # Pass optional tensor (is None if not provided)
+            lm_only=lm_only # <--- ADDProofread
         )
 
+        # If lm_only, output is just the LM dict, return it directly.
+        if lm_only:
+            return output
+
+        # --- Standard structure output processing ---
         output["atom37_atom_exists"] = output[
             "atom37_atom_exists"
         ] * linker_mask.unsqueeze(2)
@@ -368,3 +403,5 @@ class ESMFold(nn.Module):
     @property
     def device(self):
         return self.esm_s_combine.device
+
+}
